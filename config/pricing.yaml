@@ -1,0 +1,28 @@
+# config/pricing.yaml
+# USD per 1M tokens (input/output).
+# These are illustrative published list-price figures for the underlying open
+# model classes, used ONLY to compute a notional cost for the dashboard.
+# All providers used are free-tier — actual spend is $0; this enables the
+# "notional cost saved" KPI and realistic cost attribution display.
+# Free-tier OpenRouter models are explicitly priced at 0.0.
+
+pricing:
+  groq/llama-3.1-8b-instant:
+    input: 0.05
+    output: 0.08
+
+  groq/llama-3.3-70b-versatile:
+    input: 0.59
+    output: 0.79
+
+  gemini/gemini-2.0-flash:
+    input: 0.10
+    output: 0.40
+
+  openrouter/meta-llama/llama-3.1-8b-instruct:free:
+    input: 0.0
+    output: 0.0
+
+  openrouter/deepseek/deepseek-chat:free:
+    input: 0.0
+    output: 0.0

@@ -1,0 +1,45 @@
+# config/routing_rules.yaml
+# Defines the classifier thresholds and the provider fallback chain per tier.
+# A request is "complex" if EITHER condition is true; otherwise "simple".
+# Changes here take effect on gateway restart (no code change needed).
+
+classifier:
+  # Prompt longer than this character count -> complex
+  max_simple_chars: 400
+  # Presence of any keyword (case-insensitive) -> complex
+  complex_keywords:
+    - "step by step"
+    - "analyze"
+    - "architecture"
+    - "code review"
+    - "compare"
+    - "explain in detail"
+    - "write a"
+    - "debug"
+
+routes:
+  simple:
+    chain:
+      - provider: groq
+        model: llama-3.1-8b-instant
+      - provider: gemini
+        model: gemini-2.0-flash
+      - provider: openrouter
+        model: meta-llama/llama-3.1-8b-instruct:free
+
+  complex:
+    chain:
+      - provider: groq
+        model: llama-3.3-70b-versatile
+      - provider: gemini
+        model: gemini-2.0-flash
+      - provider: openrouter
+        model: deepseek/deepseek-chat:free
+
+cache:
+  semantic_similarity_threshold: 0.92
+  ttl_seconds: 86400        # 24 hours
+
+circuit_breaker:
+  failure_threshold: 3      # consecutive failures before opening
+  cooldown_seconds: 60      # time before retrying an open circuit

@@ -1,0 +1,23 @@
+# config/teams.yaml
+# Seeds the Team table on startup if the table is empty.
+# To add a team at runtime, use POST /v1/admin/teams instead.
+# WARNING: api_key values here are demo keys only — never use these in production.
+
+teams:
+  - id: team-sales
+    name: Sales Team
+    api_key: sk-team-sales-demo-key
+    daily_token_budget: 100000
+    rpm_limit: 15
+
+  - id: team-support
+    name: Support Team
+    api_key: sk-team-support-demo-key
+    daily_token_budget: 150000
+    rpm_limit: 20
+
+  - id: team-eng
+    name: Engineering Team
+    api_key: sk-team-eng-demo-key
+    daily_token_budget: 50000
+    rpm_limit: 10
