@@ -41,6 +41,8 @@ the build. Read this at the start of any new session before continuing.
 | R-18 | **`route_request()` had no retry before fallback** — a single `ProviderError` immediately advanced the chain, violating FR3 ("retry once, then fail over") | Phase 3 | Added `MAX_RETRIES = 1` to `router.py`; each provider is now attempted `MAX_RETRIES+1` times before `record_failure()` is called and the chain advances |
 | R-19 | **`embeddings.py` loaded model at import time** — any test that transitively imported `gateway.embeddings` paid the ~300ms model-load penalty even without needing embeddings | Phase 4 | Changed to lazy init: `_model = None` at module level; `_get_model()` loads on first `embed()` call |
 | R-20 | **`cache.py store()` had dead code and misplaced import** — intermediate `expires_at` assignment was immediately overwritten; `timedelta` was imported inside the function body | Phase 4 | Removed dead assignment; moved `timedelta` to top-level imports |
+| R-13 resolved | **Quota check raises before logging** | Phase 6 | `chat.py` uses explicit log_request() calls on every exit path (401, 429-rpm, 429-quota, 502, 200-cache, 200-provider). No try/finally needed because each branch is explicit. |
+| R-03 resolved | **`pricing.yaml` key format coupling** | Phase 6 | `compute_cost()` builds key as `f"{provider}/{model}"`. Tests CO-01 and CO-02 use non-zero Groq/Gemini models to verify the lookup actually works. |
 | R-21 | **No cache eviction** — expired `CacheEntry` rows were filtered at read time but never deleted; DB would grow without bound | Phase 4 | Added `evict_expired(session)` to `cache.py`; called once at startup from `init_db()` in `db.py` |
 | R-14 | **NULL `team_id` in quota queries** — `RequestLog.team_id` is `Optional[str]`; RPM and budget queries that aggregate without a team filter could mix anonymous rows into a team's count | Phase 5 | All quota queries parameterised by `team.id`; `success=True` filter in budget query; test QT-10 verifies NULL rows are excluded |
 | R-17 | **Session must be injected, never called directly** — helpers opening their own session would create a second DB connection invisible to the request session | Phase 5 | `resolve_team(session, ...)`, `check_rpm(session, ...)`, `check_daily_budget(session, ...)` all accept session as parameter; verified in tests |
@@ -73,7 +75,7 @@ the build. Read this at the start of any new session before continuing.
 - Phase 3 ✅ — routing engine (classify, get_chain, route_request with retry)
 - Phase 4 ✅ — caching (exact + semantic, eviction, lazy embeddings)
 - Phase 5 ✅ — quota & rate limiting
-- Phase 6 ⬜ — cost attribution & logging + main FastAPI app wired
+- Phase 6 ✅ — cost attribution & logging + main FastAPI app wired
 - Phase 7 ⬜ — admin & health endpoints
 - Phase 8 ⬜ — Streamlit dashboard
 - Phase 9 ⬜ — Docker + demo script
@@ -84,7 +86,8 @@ the build. Read this at the start of any new session before continuing.
 - Phase 3: 25 routing tests (test_routing.py)
 - Phase 4: 14 cache tests (test_cache.py)
 - Phase 5: 14 quota tests (test_quota.py)
-- Total passing: 61
+- Phase 6: 12 cost tests (test_cost_attribution.py)
+- Total passing: 73
 
 **Key file locations:**
 - Config: `config/teams.yaml`, `config/routing_rules.yaml`, `config/pricing.yaml`
@@ -96,4 +99,9 @@ the build. Read this at the start of any new session before continuing.
 - Embeddings: `gateway/embeddings.py` → `embed()` (lazy-loads model on first call)
 - Auth: `gateway/auth.py` → `resolve_team(session, api_key)`, `InvalidApiKeyError`
 - Quota: `gateway/quota.py` → `check_rpm(session, team)`, `check_daily_budget(session, team)`, `RateLimitedError`, `QuotaExceededError`
+- Schemas: `gateway/schemas.py` → `ChatRequest`, `ChatResponse`, `UsageInfo`, `Message`
+- Cost: `gateway/cost.py` → `compute_cost(provider, model, input_tokens, output_tokens, pricing_config)`
+- Logging: `gateway/logging_service.py` → `log_request(session, *, ...)`
+- App entrypoint: `gateway/main.py` → FastAPI app, startup hook
+- Chat route: `gateway/routes/chat.py` → full pipeline
 - Test fixtures: `tests/conftest.py`
