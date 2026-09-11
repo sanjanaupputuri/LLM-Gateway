@@ -77,7 +77,7 @@ llm-gateway/
 │   ├── quota.py                   # token budget + RPM checks, raises QuotaExceeded
 │   ├── router.py                   # classify_request(), pick_route()
 │   ├── cache.py                     # exact_lookup(), semantic_lookup(), store()
-│   ├── embeddings.py                 # load model once, embed(text) -> np.ndarray
+│   ├── embeddings.py                 # lazy-loads all-MiniLM-L6-v2 on first embed() call
 │   ├── providers/
 │   │   ├── base.py                    # ProviderClient ABC: complete(request) -> ProviderResponse
 │   │   ├── groq_client.py
@@ -123,8 +123,8 @@ class Team(SQLModel, table=True):
 class RequestLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     timestamp: datetime = Field(default_factory=datetime.utcnow, index=True)
-    team_id: str = Field(index=True)
-    route_decision: str          # "simple" | "complex"
+    team_id: Optional[str] = Field(default=None, index=True)  # None for auth failures
+    route_decision: str          # "simple" | "complex" | "" (auth failure)
     provider: str                 # "groq" | "gemini" | "openrouter" | "cache"
     model: str
     cache_status: str              # "miss" | "exact" | "semantic"
@@ -297,6 +297,30 @@ def classify(messages, rules) -> "simple" | "complex":
     return "simple"
 ```
 
+**Retry behaviour (FR3) — implemented in `router.py`:**
+
+`route_request()` iterates the provider chain and, for each provider,
+attempts the call up to `MAX_RETRIES + 1` times before advancing to the
+next provider. `MAX_RETRIES = 1` (one initial attempt + one retry).
+`record_failure()` on the circuit breaker is only called after all retries
+for that provider are exhausted — a single transient error does not
+immediately trip the breaker or trigger a fallback.
+
+```
+for each step in chain:
+    if breaker.is_open(): skip
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            response = await client.complete(...)
+            breaker.record_success()
+            return response
+        except ProviderError:
+            if attempt < MAX_RETRIES: continue   # retry same provider
+    breaker.record_failure()                      # all retries exhausted
+    # advance to next provider
+raise AllProvidersFailedError
+```
+
 ### 9. Cache key & semantic lookup (implement exactly)
 
 - Exact key: `sha256(json.dumps({model_tier, messages, temperature,
@@ -308,6 +332,24 @@ def classify(messages, rules) -> "simple" | "complex":
   entry's `response_json` and increment its `hit_count`.
 - On any provider response (cache miss path), write a new `CacheEntry`
   with `expires_at = now + cache.ttl_seconds`.
+
+**Embedding model loading — lazy, not at import time:**
+
+`gateway/embeddings.py` holds the `SentenceTransformer` instance in a
+module-level variable initialised to `None`. The model is loaded on the
+first call to `embed()` via an internal `_get_model()` helper. This
+ensures test files that import from `gateway` but do not exercise the
+cache do not pay the ~300ms model-load penalty on every test run.
+The single-load guarantee is preserved: once set, the instance is reused
+for the process lifetime.
+
+**Cache eviction:**
+
+Expired rows are filtered at read time by `WHERE expires_at > now`, but
+they are never automatically deleted — without explicit cleanup the table
+grows without bound. `cache.evict_expired(session)` deletes all rows with
+`expires_at <= now` and is called once per startup inside `init_db()` in
+`gateway/db.py`.
 
 ### 10. Quota & rate limit checks (order of operations in `chat.py`)
 
@@ -321,6 +363,43 @@ def classify(messages, rules) -> "simple" | "complex":
 5. Log the request (success or failure) regardless of outcome, including
    429s (with `success=false`, `error_message` set), so the dashboard can
    show throttling events.
+
+**Session injection rule (enforced from Phase 5 onwards):**
+
+Every function in `auth.py`, `quota.py`, and `logging_service.py` must
+accept `session: Session` as an explicit parameter — never call
+`get_session()` internally. If a helper opens its own session it creates a
+second database connection, and writes made in one session will not be
+visible in the other within the same request. Only `chat.py` (the route
+handler) depends on `get_session` via FastAPI's `Depends()`.
+
+```python
+# Correct pattern
+def resolve_team(session: Session, api_key: str) -> Team: ...
+def check_rpm(session: Session, team: Team) -> None: ...
+def log_request(session: Session, ...) -> RequestLog: ...
+
+# Wrong — never do this inside auth/quota/logging helpers
+def resolve_team(api_key: str) -> Team:
+    session = next(get_session())   # opens a second session
+    ...
+```
+
+**Logging must cover all exit paths:**
+
+`log_request()` must be called on every code path in `chat.py`, not just
+the success path. Use a `try/finally` pattern or explicit catch blocks so
+that 401, 429 (rate limit), 429 (quota exceeded), 502, and 504 responses
+all produce a `RequestLog` row (with `success=False` and `error_message`
+set). Requests that are throttled or rejected must be visible in the
+dashboard — invisible failures make quota enforcement unauditable.
+
+**NULL `team_id` in quota queries:**
+
+`RequestLog.team_id` is `Optional[str]` — it is `None` for auth failures
+logged before a team is resolved. All RPM and budget queries must include
+`WHERE team_id = :team_id` (parameterised) so anonymous rows are never
+accidentally aggregated into a team's counts.
 
 ### 11. Dashboard data contract
 
