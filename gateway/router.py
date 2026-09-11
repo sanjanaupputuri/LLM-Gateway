@@ -1,6 +1,12 @@
 # gateway/router.py
 # Routing engine: classify(), get_chain(), and route_request().
 # Spec: docs/02_ARCHITECTURE.md §8, docs/04_BUILD_PLAN.md Phase 3
+#
+# Retry behaviour (FR3):
+#   For each step in the chain, the provider is attempted up to MAX_RETRIES+1
+#   times before the failure is recorded on the circuit breaker and the router
+#   moves to the next provider.  Only after exhausting every retry on every
+#   step is AllProvidersFailedError raised.
 
 from __future__ import annotations
 
@@ -12,6 +18,11 @@ from gateway.providers.base import ProviderClient, ProviderError, ProviderRespon
 from gateway.providers.circuit_breaker import get_breaker
 
 logger = logging.getLogger(__name__)
+
+# Number of additional attempts per provider before moving to the next in the
+# chain.  FR3 specifies "retry once … then fail over", so MAX_RETRIES = 1
+# means each provider gets at most 2 attempts (1 initial + 1 retry).
+MAX_RETRIES: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +127,18 @@ async def route_request(
     """Classify the request, pick a provider chain, and attempt each step
     in order until one succeeds or all are exhausted.
 
+    Retry behaviour (FR3):
+    - Each provider in the chain is attempted up to MAX_RETRIES+1 times
+      before moving to the next provider.
+    - record_failure() is only called (and the router advances) after all
+      retries for that provider are exhausted.
+    - On success at any attempt, record_success() is called and the function
+      returns immediately.
+
     Circuit-breaker integration:
     - Any provider whose breaker is_open() is skipped immediately (no call made).
-    - On ProviderError, record_failure() is called on that provider's breaker.
+    - On ProviderError after all retries, record_failure() is called on that
+      provider's breaker.
     - On success, record_success() is called and the function returns.
 
     Args:
@@ -164,32 +184,46 @@ async def route_request(
             )
             continue
 
-        # Attempt the call
-        logger.info(
-            "Attempting provider=%r model=%r tier=%r", provider_name, model, tier
-        )
-        try:
-            response = await client.complete(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            breaker.record_success()
+        # Attempt the call — up to MAX_RETRIES+1 times before moving on.
+        last_exc: ProviderError | None = None
+        for attempt in range(MAX_RETRIES + 1):
             logger.info(
-                "Success: provider=%r model=%r in=%d out=%d",
-                provider_name,
-                model,
-                response.input_tokens,
-                response.output_tokens,
+                "Attempting provider=%r model=%r tier=%r attempt=%d/%d",
+                provider_name, model, tier, attempt + 1, MAX_RETRIES + 1,
             )
-            return response, provider_name, model
+            try:
+                response = await client.complete(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                breaker.record_success()
+                logger.info(
+                    "Success: provider=%r model=%r in=%d out=%d",
+                    provider_name,
+                    model,
+                    response.input_tokens,
+                    response.output_tokens,
+                )
+                return response, provider_name, model
 
-        except ProviderError as exc:
-            logger.warning(
-                "ProviderError from %r: %s — recording failure.", provider_name, exc
-            )
-            breaker.record_failure()
-            errors.append(exc)
+            except ProviderError as exc:
+                last_exc = exc
+                if attempt < MAX_RETRIES:
+                    logger.warning(
+                        "ProviderError from %r (attempt %d/%d): %s — retrying.",
+                        provider_name, attempt + 1, MAX_RETRIES + 1, exc,
+                    )
+                else:
+                    logger.warning(
+                        "ProviderError from %r after %d attempt(s): %s — recording failure.",
+                        provider_name, MAX_RETRIES + 1, exc,
+                    )
+
+        # All retries for this provider exhausted — record failure and try next.
+        assert last_exc is not None
+        breaker.record_failure()
+        errors.append(last_exc)
 
     raise AllProvidersFailedError(tier=tier, errors=errors)
