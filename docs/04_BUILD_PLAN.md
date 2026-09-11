@@ -100,36 +100,52 @@ from `05_TEST_PLAN.md` before moving on.
      provider/model chain for a tier from `routing_rules.yaml`.
    - `async def route_request(messages, temperature, max_tokens, rules,
      provider_clients) -> tuple[ProviderResponse, str provider_used, str
-     model_used]`: classifies, gets the chain, iterates the chain skipping
-     any provider whose circuit breaker `is_open()`, calls
-     `client.complete(...)`, and on `ProviderError` records the failure on
-     that provider's breaker and tries the next step. Raises
-     `AllProvidersFailedError` if the whole chain is exhausted.
+     model_used]`: classifies, gets the chain, and for each step:
+     - Skips the provider if its circuit breaker `is_open()`.
+     - Attempts the call up to `MAX_RETRIES + 1` times (FR3: retry once
+       before falling over). `MAX_RETRIES = 1`.
+     - Calls `record_failure()` on the breaker only after **all** retries
+       for that provider are exhausted, then tries the next step.
+     - Raises `AllProvidersFailedError` if the whole chain is exhausted.
+3. Rewrite `tests/test_fallback.py` to call the real `route_request()`
+   rather than a hand-rolled helper — fallback tests must exercise the
+   actual production code path.
 
 **Acceptance criteria**
 - `tests/test_routing.py` passes: a short/simple prompt classifies
   `"simple"`; a long prompt (>400 chars) and a prompt containing
   "analyze" both classify `"complex"`.
+- `tests/test_fallback.py` passes all 8 tests, including FB-08 (retry
+  succeeds on second attempt — no fallback triggered). When groq fails,
+  `groq.complete` call count must equal `MAX_RETRIES + 1` (i.e. 2),
+  not 1.
 
 ---
 
 ## Phase 4 — Caching
 
 **Tasks**
-1. Implement `gateway/embeddings.py`: loads `all-MiniLM-L6-v2` once at
-   module import (not per-request — this is the single most important
-   performance detail in this phase), exposes `embed(text: str) ->
-   np.ndarray`.
+1. Implement `gateway/embeddings.py`: exposes `embed(text: str) ->
+   np.ndarray`. The `all-MiniLM-L6-v2` model must be **lazy-loaded** —
+   initialised on the first call to `embed()`, not at module import time.
+   This prevents every test file that imports from `gateway` from paying
+   the ~300ms model-load penalty. The single-load guarantee (one instance
+   per process) is still preserved via a module-level `_model` variable.
 2. Implement `gateway/cache.py`:
    - `make_cache_key(model_tier, messages, temperature, max_tokens) ->
      str` (sha256 per §9).
    - `exact_lookup(session, key) -> CacheEntry | None`.
-   - `semantic_lookup(session, model_tier, query_text, threshold) ->
+   - `semantic_lookup(session, model_tier, query_embedding, threshold) ->
      CacheEntry | None` — brute-force cosine similarity over all
      non-expired rows for that tier.
    - `store(session, key, model_tier, prompt_text, embedding,
-     response_json, ttl_seconds)`.
-3. Wire cache lookup into the request flow in `routes/chat.py` **before**
+     response_json, ttl_seconds) -> CacheEntry`.
+   - `evict_expired(session) -> int` — deletes all rows with
+     `expires_at <= now`; returns count deleted. Without this, expired
+     rows accumulate on disk indefinitely.
+3. Call `evict_expired()` once at startup inside `init_db()` in
+   `gateway/db.py`, immediately after table creation.
+4. Wire cache lookup into the request flow in `routes/chat.py` **before**
    routing: exact lookup first, then semantic lookup, then only if both
    miss, call `route_request`.
 
@@ -138,6 +154,9 @@ from `05_TEST_PLAN.md` before moving on.
   `cache_status: "exact"`, provider client is not called (assert via
   mock call count). A paraphrased near-duplicate request → third call is
   `cache_status: "semantic"`.
+- Importing `gateway.embeddings` in a test that never calls `embed()`
+  does not trigger a model download or load (verify by checking that
+  `embeddings._model` is still `None` after a bare import).
 
 ---
 
@@ -149,8 +168,15 @@ from `05_TEST_PLAN.md` before moving on.
      §10 step 2.
    - `check_daily_budget(session, team) -> None`, raises
      `QuotaExceededError` per §10 step 3.
+   - Both functions must accept `session: Session` as a parameter —
+     never call `get_session()` internally (see session injection rule
+     in `02_ARCHITECTURE.md` §10).
+   - Both queries must use `WHERE team_id = :team_id` (parameterised) —
+     never aggregate without a team filter, as `team_id` is `Optional`
+     and NULL rows from auth failures must not be included.
 2. Implement `gateway/auth.py`: `resolve_team(session, api_key) -> Team`,
-   raises `InvalidApiKeyError` if not found.
+   raises `InvalidApiKeyError` if not found. Accepts `session` as a
+   parameter — never calls `get_session()` internally.
 3. Wire both into `routes/chat.py` in the exact order specified in §10.
 
 **Acceptance criteria**
@@ -170,22 +196,34 @@ from `05_TEST_PLAN.md` before moving on.
 1. Implement `gateway/cost.py`: `compute_cost(provider, model,
    input_tokens, output_tokens, pricing_config) -> float`, reading
    `config/pricing.yaml`. Return `0.0` for any model/provider not found
-   in the pricing table (log a warning, don't crash).
+   in the pricing table (log a warning, don't crash). The lookup key is
+   `f"{provider}/{model}"` — e.g. `"groq/llama-3.1-8b-instant"`.
 2. Implement `gateway/logging_service.py`: `log_request(session, ...) ->
-   RequestLog`, called on every code path in `routes/chat.py` — success,
-   cache hit, 429, and 502/504 — so nothing is invisible to the
-   dashboard.
+   RequestLog`. Accepts `session: Session` as a parameter — never calls
+   `get_session()` internally (see session injection rule in
+   `02_ARCHITECTURE.md` §10).
 3. Wire `POST /v1/chat/completions` end-to-end per the flow in
-   `03_API_CONTRACTS.md`.
+   `03_API_CONTRACTS.md`. Use a `try/finally` pattern in `chat.py` so
+   that `log_request()` is called on **every exit path**: 200 (success),
+   200 (cache hit), 429 (rate limited), 429 (quota exceeded), 502
+   (all providers failed), and 504 (timeout). Requests that are throttled
+   or rejected must appear in `RequestLog` — invisible failures make quota
+   enforcement unauditable.
 
 **Acceptance criteria**
 - `tests/test_cost_attribution.py` passes: a mocked Groq response with
-  known input/output token counts produces the exact expected
-  `cost_usd` per the pricing table's per-token math.
+  known input/output token counts produces the exact expected `cost_usd`
+  per the pricing table's per-token math. The test **must** use a
+  non-zero-price model (e.g. `groq/llama-3.1-8b-instant` at $0.05/1M
+  input) — testing only with free OpenRouter models would pass vacuously
+  since `cost_usd` would be `0.0` regardless of whether the key lookup
+  works.
 - Manually hit the endpoint 5 times with `curl` (using a real or mocked
   key) and confirm 5 rows appear in `RequestLog` via a quick `sqlite3
   data/gateway.db "select * from requestlog;"`.
-
+- Hit the endpoint with a bad API key (401) and with a team that has
+  budget exhausted (429) — confirm both produce `RequestLog` rows with
+  `success=False`.
 ---
 
 ## Phase 7 — Admin & health endpoints
