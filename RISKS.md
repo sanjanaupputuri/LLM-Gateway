@@ -25,10 +25,6 @@ the build. Read this at the start of any new session before continuing.
 | R-05 | Low | **`lru_cache` on config loaders** — tests that modify `os.environ` directly (not via pytest `monkeypatch`) and forget to call `clear_config_cache()` will read stale config silently. The `autouse` `clear_caches` fixture in `conftest.py` runs before/after every test, which mitigates this. | Ongoing — watch in Phases 3–6 | Always use `monkeypatch.setenv` in tests, never `os.environ[...] =` directly |
 | R-11 | Medium | **Circuit breaker state is process-local and resets on restart** — if the gateway restarts mid-incident, all breakers reset to CLOSED and the failing provider gets hammered again. Acceptable for demo (per spec), but document in README. | Phase 10 (README) | By design per spec — no persistence needed |
 | R-13 | Medium | **Quota check raises before logging — 429s will be invisible to dashboard** — the quota/rate-limit check in `chat.py` raises an exception before the provider is called. If the logging call is placed only on the success path, throttled requests won't appear in `RequestLog` or the dashboard. The logging call **must** be in a `finally` block (or equivalent catch-and-log on every exit path). | Phase 6 (chat.py) | Every exit path — 401, 429 (rate limit), 429 (quota), 502, 504, 200 — must write a RequestLog row |
-| R-14 | Low | **NULL `team_id` in quota queries** — `RequestLog.team_id` is `Optional[str]` (None for auth failures). RPM and daily-budget queries that `WHERE team_id = :id` are safe, but any query that aggregates without filtering `team_id IS NOT NULL` could accidentally mix anonymous rows into a team's count. | Phase 5 (quota.py) | Verify all quota queries include explicit `team_id IS NOT NULL` or are parameterized by team |
-| R-15 | Low | **`lru_cache` config — no hot-reload** — config changes require a full restart. The `/healthz` endpoint (Phase 7) should surface which config was loaded and when, so an operator can confirm the running config matches intent. | Phase 7 (health.py) | Acceptable limitation — document in README |
-| R-16 | Low | **Dashboard DB path hard-coded to SQLite** — `dashboard/app.py` will need to read `GATEWAY_DB_PATH` (or a `DATABASE_URL`) from environment, not hard-code a path, to keep the optional Render + Streamlit Cloud deployment path viable without a rewrite. | Phase 8 (dashboard/app.py) | Use `os.getenv("GATEWAY_DB_PATH", "./data/gateway.db")` |
-| R-17 | Medium | **Session must be injected, never called directly** — every function in `auth.py`, `quota.py`, `logging_service.py` must accept `session: Session` as a parameter. If any of them calls `get_session()` internally they will open a second session, and writes in one won't be visible in the other within the same request. Only `chat.py` (the route handler) should depend on `get_session` via FastAPI DI. | Phase 5 (auth.py, quota.py) / Phase 6 (logging_service.py) | Pattern: `def resolve_team(session: Session, api_key: str) -> Team` |
 
 ---
 
@@ -46,6 +42,8 @@ the build. Read this at the start of any new session before continuing.
 | R-19 | **`embeddings.py` loaded model at import time** — any test that transitively imported `gateway.embeddings` paid the ~300ms model-load penalty even without needing embeddings | Phase 4 | Changed to lazy init: `_model = None` at module level; `_get_model()` loads on first `embed()` call |
 | R-20 | **`cache.py store()` had dead code and misplaced import** — intermediate `expires_at` assignment was immediately overwritten; `timedelta` was imported inside the function body | Phase 4 | Removed dead assignment; moved `timedelta` to top-level imports |
 | R-21 | **No cache eviction** — expired `CacheEntry` rows were filtered at read time but never deleted; DB would grow without bound | Phase 4 | Added `evict_expired(session)` to `cache.py`; called once at startup from `init_db()` in `db.py` |
+| R-14 | **NULL `team_id` in quota queries** — `RequestLog.team_id` is `Optional[str]`; RPM and budget queries that aggregate without a team filter could mix anonymous rows into a team's count | Phase 5 | All quota queries parameterised by `team.id`; `success=True` filter in budget query; test QT-10 verifies NULL rows are excluded |
+| R-17 | **Session must be injected, never called directly** — helpers opening their own session would create a second DB connection invisible to the request session | Phase 5 | `resolve_team(session, ...)`, `check_rpm(session, ...)`, `check_daily_budget(session, ...)` all accept session as parameter; verified in tests |
 
 ---
 
@@ -74,7 +72,7 @@ the build. Read this at the start of any new session before continuing.
 - Phase 2 ✅ — provider clients (groq, gemini, openrouter, circuit breaker) + FB tests
 - Phase 3 ✅ — routing engine (classify, get_chain, route_request with retry)
 - Phase 4 ✅ — caching (exact + semantic, eviction, lazy embeddings)
-- Phase 5 ⬜ — quota & rate limiting
+- Phase 5 ✅ — quota & rate limiting
 - Phase 6 ⬜ — cost attribution & logging + main FastAPI app wired
 - Phase 7 ⬜ — admin & health endpoints
 - Phase 8 ⬜ — Streamlit dashboard
@@ -85,7 +83,8 @@ the build. Read this at the start of any new session before continuing.
 - Phase 2: 8 fallback tests (test_fallback.py)
 - Phase 3: 25 routing tests (test_routing.py)
 - Phase 4: 14 cache tests (test_cache.py)
-- Total passing: 47
+- Phase 5: 14 quota tests (test_quota.py)
+- Total passing: 61
 
 **Key file locations:**
 - Config: `config/teams.yaml`, `config/routing_rules.yaml`, `config/pricing.yaml`
@@ -95,4 +94,6 @@ the build. Read this at the start of any new session before continuing.
 - Router: `gateway/router.py` → `classify()`, `get_chain()`, `route_request()`, `MAX_RETRIES`
 - Cache: `gateway/cache.py` → `make_cache_key()`, `exact_lookup()`, `semantic_lookup()`, `store()`, `evict_expired()`
 - Embeddings: `gateway/embeddings.py` → `embed()` (lazy-loads model on first call)
+- Auth: `gateway/auth.py` → `resolve_team(session, api_key)`, `InvalidApiKeyError`
+- Quota: `gateway/quota.py` → `check_rpm(session, team)`, `check_daily_budget(session, team)`, `RateLimitedError`, `QuotaExceededError`
 - Test fixtures: `tests/conftest.py`
