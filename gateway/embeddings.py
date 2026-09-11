@@ -1,7 +1,15 @@
 # gateway/embeddings.py
-# Loads all-MiniLM-L6-v2 once at module import and exposes embed().
-# The model is loaded ONCE — not per-request — to avoid the ~300ms
-# cold-start penalty on every cache lookup.
+# Exposes embed() for encoding text into a unit-normalised embedding vector.
+# Model: all-MiniLM-L6-v2 (~80 MB, runs locally, no API cost).
+#
+# Loading strategy — LAZY (not at import time):
+#   The model is initialised on the first call to embed(), not when this
+#   module is imported.  This means test files that import gateway.cache or
+#   gateway.router (which will import cache in Phase 6) do NOT pay the
+#   ~300 ms model-load penalty unless they actually call embed().
+#   The single-load guarantee is preserved: once _model is set it is never
+#   replaced, so the overhead is paid at most once per process lifetime.
+#
 # Spec: docs/02_ARCHITECTURE.md §9, docs/04_BUILD_PLAN.md Phase 4
 
 from __future__ import annotations
@@ -13,17 +21,20 @@ from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Model — loaded once at import time.
-# sentence-transformers downloads and caches the weights (~80 MB) on first
-# use; subsequent imports load from the local HuggingFace cache instantly.
-# ---------------------------------------------------------------------------
-
 _MODEL_NAME = "all-MiniLM-L6-v2"
 
-logger.info("Loading embedding model %r …", _MODEL_NAME)
-_model: SentenceTransformer = SentenceTransformer(_MODEL_NAME)
-logger.info("Embedding model %r loaded.", _MODEL_NAME)
+# Module-level holder — None until the first embed() call.
+_model: SentenceTransformer | None = None
+
+
+def _get_model() -> SentenceTransformer:
+    """Return the shared SentenceTransformer instance, loading it on first call."""
+    global _model
+    if _model is None:
+        logger.info("Loading embedding model %r …", _MODEL_NAME)
+        _model = SentenceTransformer(_MODEL_NAME)
+        logger.info("Embedding model %r loaded.", _MODEL_NAME)
+    return _model
 
 
 # ---------------------------------------------------------------------------
@@ -41,9 +52,8 @@ def embed(text: str) -> np.ndarray:
         output dimension.  The vector is L2-normalised so that dot-product
         equals cosine similarity.
     """
-    # encode() returns a 2-D array for a list input or 1-D for a single
-    # string; we always pass a single string and squeeze to 1-D.
-    vector: np.ndarray = _model.encode(
+    model = _get_model()
+    vector: np.ndarray = model.encode(
         text,
         normalize_embeddings=True,   # L2-normalise → cosine sim == dot product
         convert_to_numpy=True,
