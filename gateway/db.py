@@ -12,6 +12,7 @@ from typing import Generator
 import yaml
 from sqlmodel import Session, SQLModel, create_engine
 
+from gateway.cache import evict_expired
 from gateway.models import Team
 
 logger = logging.getLogger(__name__)
@@ -78,6 +79,10 @@ def init_db(
     # Create all tables defined in SQLModel metadata.
     SQLModel.metadata.create_all(target_engine)
     logger.info("Database tables created / verified.")
+
+    # Evict expired cache rows on every startup so disk doesn't grow unbounded.
+    with Session(target_engine) as evict_session:
+        evict_expired(evict_session)
 
     # Seed teams only when the table is empty.
     with Session(target_engine) as session:

@@ -7,11 +7,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import numpy as np
-from sqlmodel import Session, select
+from sqlmodel import Session, delete, select
 
 from gateway.models import CacheEntry
 
@@ -178,12 +178,6 @@ def store(
         The newly created CacheEntry.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    expires_at = datetime(
-        now.year, now.month, now.day,
-        now.hour, now.minute, now.second,
-    )
-    # Add TTL using timedelta
-    from datetime import timedelta
     expires_at = now + timedelta(seconds=ttl_seconds)
 
     entry = CacheEntry(
@@ -207,3 +201,33 @@ def store(
         expires_at.isoformat(),
     )
     return entry
+
+
+# ---------------------------------------------------------------------------
+# evict_expired
+# ---------------------------------------------------------------------------
+
+def evict_expired(session: Session) -> int:
+    """Delete all CacheEntry rows whose expires_at is in the past.
+
+    Intended to be called once at gateway startup (from init_db()) to
+    prevent unbounded disk growth.  The semantic lookup query already
+    filters expired rows at read time, but without this cleanup they
+    accumulate on disk indefinitely.
+
+    Args:
+        session: Active SQLModel session.
+
+    Returns:
+        Number of rows deleted.
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    stmt = delete(CacheEntry).where(CacheEntry.expires_at <= now)
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    session.commit()
+    deleted = result.rowcount  # type: ignore[union-attr]
+    if deleted:
+        logger.info("Cache eviction: deleted %d expired row(s).", deleted)
+    else:
+        logger.debug("Cache eviction: no expired rows found.")
+    return deleted
