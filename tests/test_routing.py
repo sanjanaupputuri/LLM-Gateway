@@ -241,7 +241,9 @@ async def test_route_request_falls_back_to_secondary(rules):
 
     assert provider == "gemini"
     assert resp.text == "Hello from Gemini"
-    groq.complete.assert_called_once()
+    # Groq is retried MAX_RETRIES+1 times before the router falls back
+    from gateway.router import MAX_RETRIES
+    assert groq.complete.call_count == MAX_RETRIES + 1
     gemini.complete.assert_called_once()
     openrouter.complete.assert_not_called()
 

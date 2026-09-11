@@ -3,38 +3,51 @@
 # Spec: docs/05_TEST_PLAN.md §3.2
 #
 # All provider HTTP calls are mocked with respx — no real API keys needed.
-# Tests exercise the provider clients + circuit breaker directly; the router
-# integration is verified here via a helper that mimics route_request() logic.
+# Tests exercise the full route_request() path from gateway/router.py,
+# including the retry-before-fallback behaviour added in Phase 3 (FR3).
+#
+# Note on call counts:
+#   route_request() retries each provider MAX_RETRIES+1 times (currently 2)
+#   before advancing the chain.  Tests that expect a provider to fail assert
+#   call_count == MAX_RETRIES + 1 (i.e. 2), not 1.
 
 from __future__ import annotations
 
-import json
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import respx
 from httpx import Response
 
-from gateway.providers.base import ProviderError
+from gateway.config import get_routing_rules
+from gateway.providers.base import ProviderError, ProviderResponse
 from gateway.providers.circuit_breaker import get_breaker, reset_all_breakers
 from gateway.providers.groq_client import GroqClient, _GROQ_BASE_URL
 from gateway.providers.gemini_client import GeminiClient, _GEMINI_BASE_URL
 from gateway.providers.openrouter_client import OpenRouterClient, _OPENROUTER_BASE_URL
+from gateway.router import MAX_RETRIES, AllProvidersFailedError, route_request
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Constants shared across tests
 # ---------------------------------------------------------------------------
 
+RULES_PATH = "config/routing_rules.yaml"
 MESSAGES = [{"role": "user", "content": "Hello"}]
 TEMPERATURE = 0.7
 MAX_TOKENS = 64
 
+
+# ---------------------------------------------------------------------------
 # Minimal valid mock response bodies per provider format
+# ---------------------------------------------------------------------------
+
 def _groq_body(text: str = "Hi there", input_t: int = 5, output_t: int = 3) -> dict:
     return {
         "choices": [{"message": {"role": "assistant", "content": text}}],
         "usage": {"prompt_tokens": input_t, "completion_tokens": output_t},
     }
+
 
 def _gemini_body(text: str = "Hi there", input_t: int = 5, output_t: int = 3) -> dict:
     return {
@@ -42,11 +55,21 @@ def _gemini_body(text: str = "Hi there", input_t: int = 5, output_t: int = 3) ->
         "usageMetadata": {"promptTokenCount": input_t, "candidatesTokenCount": output_t},
     }
 
+
 def _openrouter_body(text: str = "Hi there", input_t: int = 5, output_t: int = 3) -> dict:
     return {
         "choices": [{"message": {"role": "assistant", "content": text}}],
         "usage": {"prompt_tokens": input_t, "completion_tokens": output_t},
     }
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def rules():
+    return get_routing_rules(RULES_PATH)
 
 
 @pytest.fixture(autouse=True)
@@ -61,62 +84,24 @@ def reset_breakers():
 def groq() -> GroqClient:
     return GroqClient(api_key="test-groq-key")
 
+
 @pytest.fixture
 def gemini() -> GeminiClient:
     return GeminiClient(api_key="test-gemini-key")
+
 
 @pytest.fixture
 def openrouter() -> OpenRouterClient:
     return OpenRouterClient(api_key="test-openrouter-key")
 
 
-# ---------------------------------------------------------------------------
-# Helper: mimics the router's fallback chain logic for testing
-# ---------------------------------------------------------------------------
+@pytest.fixture
+def clients(groq, gemini, openrouter) -> dict:
+    return {"groq": groq, "gemini": gemini, "openrouter": openrouter}
 
-async def _run_chain(
-    clients: list,
-    *,
-    model_map: dict | None = None,
-    max_retries: int = 1,
-) -> tuple[object, str]:
-    """Try each client in order, retrying once per client on ProviderError.
 
-    Returns (ProviderResponse, provider_name) or raises ProviderError if all fail.
-    """
-    default_models = {
-        "groq": "llama-3.1-8b-instant",
-        "gemini": "gemini-2.0-flash",
-        "openrouter": "meta-llama/llama-3.1-8b-instruct:free",
-    }
-    models = model_map or default_models
-
-    last_error = None
-    for client in clients:
-        breaker = get_breaker(client.name)
-        if breaker.is_open():
-            continue  # skip — circuit is open
-
-        model = models[client.name]
-        attempt = 0
-        while attempt <= max_retries:
-            try:
-                resp = await client.complete(
-                    model=model,
-                    messages=MESSAGES,
-                    temperature=TEMPERATURE,
-                    max_tokens=MAX_TOKENS,
-                )
-                breaker.record_success()
-                return resp, client.name
-            except ProviderError as exc:
-                last_error = exc
-                attempt += 1
-                if attempt > max_retries:
-                    breaker.record_failure()
-                    break
-
-    raise last_error or ProviderError("all", "All providers failed")
+# Gemini URL for the simple-tier model
+_GEMINI_FLASH_URL = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
 
 
 # ---------------------------------------------------------------------------
@@ -124,67 +109,84 @@ async def _run_chain(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb01_primary_succeeds(groq, gemini, openrouter):
+async def test_fb01_primary_succeeds(rules, clients):
     with respx.mock(assert_all_called=False) as mock:
         groq_route = mock.post(_GROQ_BASE_URL).mock(
             return_value=Response(200, json=_groq_body("Hello from Groq"))
         )
-        gemini_url = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
-        gemini_route = mock.post(gemini_url).mock(
+        gemini_route = mock.post(_GEMINI_FLASH_URL).mock(
             return_value=Response(200, json=_gemini_body())
         )
         openrouter_route = mock.post(_OPENROUTER_BASE_URL).mock(
             return_value=Response(200, json=_openrouter_body())
         )
 
-        resp, provider = await _run_chain([groq, gemini, openrouter])
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
 
     assert provider == "groq"
     assert resp.text == "Hello from Groq"
-    assert groq_route.called
+    # Succeeded on first attempt — exactly 1 call to groq
+    assert groq_route.call_count == 1
     assert not gemini_route.called
     assert not openrouter_route.called
 
 
 # ---------------------------------------------------------------------------
-# FB-02: Primary fails twice (1 try + 1 retry), falls over to Gemini
+# FB-02: Primary fails on all retries, falls over to Gemini
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb02_primary_fails_falls_to_secondary(groq, gemini, openrouter):
+async def test_fb02_primary_fails_falls_to_secondary(rules, clients):
+    """Groq fails every attempt; after MAX_RETRIES+1 tries router falls to Gemini."""
     with respx.mock(assert_all_called=False) as mock:
         groq_route = mock.post(_GROQ_BASE_URL).mock(
             return_value=Response(500, text="Internal Server Error")
         )
-        gemini_url = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
-        gemini_route = mock.post(gemini_url).mock(
+        gemini_route = mock.post(_GEMINI_FLASH_URL).mock(
             return_value=Response(200, json=_gemini_body("Hello from Gemini"))
         )
 
-        resp, provider = await _run_chain([groq, gemini, openrouter])
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
 
     assert provider == "gemini"
     assert resp.text == "Hello from Gemini"
-    # Groq should be called exactly twice (1 try + 1 retry)
-    assert groq_route.call_count == 2
+    # Groq must be called MAX_RETRIES+1 times (initial + retries) before fallback
+    assert groq_route.call_count == MAX_RETRIES + 1
     assert gemini_route.call_count == 1
 
 
 # ---------------------------------------------------------------------------
-# FB-03: Primary and secondary fail, tertiary succeeds
+# FB-03: Primary and secondary fail on all retries, tertiary succeeds
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb03_tertiary_succeeds(groq, gemini, openrouter):
+async def test_fb03_tertiary_succeeds(rules, clients):
     with respx.mock(assert_all_called=False) as mock:
         mock.post(_GROQ_BASE_URL).mock(return_value=Response(500, text="Error"))
-        gemini_url = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
-        mock.post(gemini_url).mock(return_value=Response(500, text="Error"))
+        mock.post(_GEMINI_FLASH_URL).mock(return_value=Response(500, text="Error"))
         openrouter_route = mock.post(_OPENROUTER_BASE_URL).mock(
             return_value=Response(200, json=_openrouter_body("Hello from OpenRouter"))
         )
 
-        resp, provider = await _run_chain([groq, gemini, openrouter])
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
 
     assert provider == "openrouter"
     assert resp.text == "Hello from OpenRouter"
@@ -192,45 +194,58 @@ async def test_fb03_tertiary_succeeds(groq, gemini, openrouter):
 
 
 # ---------------------------------------------------------------------------
-# FB-04: All providers fail — raises ProviderError (gateway returns 502)
+# FB-04: All providers fail all retries — raises AllProvidersFailedError
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb04_all_providers_fail(groq, gemini, openrouter):
+async def test_fb04_all_providers_fail(rules, clients):
     with respx.mock(assert_all_called=False) as mock:
         mock.post(_GROQ_BASE_URL).mock(return_value=Response(500, text="Error"))
-        gemini_url = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
-        mock.post(gemini_url).mock(return_value=Response(500, text="Error"))
+        mock.post(_GEMINI_FLASH_URL).mock(return_value=Response(500, text="Error"))
         mock.post(_OPENROUTER_BASE_URL).mock(return_value=Response(500, text="Error"))
 
-        with pytest.raises(ProviderError):
-            await _run_chain([groq, gemini, openrouter])
+        with pytest.raises(AllProvidersFailedError):
+            await route_request(
+                messages=MESSAGES,
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+                rules=rules,
+                provider_clients=clients,
+            )
 
 
 # ---------------------------------------------------------------------------
-# FB-05: Circuit breaker opens after 3 consecutive failures — 4th skips Groq
+# FB-05: Circuit breaker opens after threshold failures — next call skips Groq
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb05_circuit_breaker_opens(groq, gemini, openrouter):
-    # Force the Groq breaker to open by recording 3 failures directly
-    breaker = get_breaker("groq", failure_threshold=3, cooldown_seconds=60)
-    breaker.record_failure()
-    breaker.record_failure()
-    breaker.record_failure()
+async def test_fb05_circuit_breaker_opens(rules, clients):
+    # Force the Groq breaker open by recording failures directly
+    breaker = get_breaker(
+        "groq",
+        failure_threshold=rules.circuit_breaker.failure_threshold,
+        cooldown_seconds=rules.circuit_breaker.cooldown_seconds,
+    )
+    for _ in range(rules.circuit_breaker.failure_threshold):
+        breaker.record_failure()
 
-    assert breaker.is_open(), "Breaker should be open after 3 failures"
+    assert breaker.is_open(), "Breaker should be open after threshold failures"
 
     with respx.mock(assert_all_called=False) as mock:
         groq_route = mock.post(_GROQ_BASE_URL).mock(
             return_value=Response(200, json=_groq_body())
         )
-        gemini_url = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
-        gemini_route = mock.post(gemini_url).mock(
+        gemini_route = mock.post(_GEMINI_FLASH_URL).mock(
             return_value=Response(200, json=_gemini_body("Gemini took over"))
         )
 
-        resp, provider = await _run_chain([groq, gemini, openrouter])
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
 
     # Groq must NOT have been called — breaker was open
     assert provider == "gemini"
@@ -243,20 +258,22 @@ async def test_fb05_circuit_breaker_opens(groq, gemini, openrouter):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb06_half_open_recovery(groq, gemini, openrouter):
+async def test_fb06_half_open_recovery(rules, clients):
     from gateway.providers.circuit_breaker import BreakerState
 
-    # Force breaker open then manually backdate opened_at past the cooldown
-    breaker = get_breaker("groq", failure_threshold=3, cooldown_seconds=60)
-    breaker.record_failure()
-    breaker.record_failure()
-    breaker.record_failure()
+    breaker = get_breaker(
+        "groq",
+        failure_threshold=rules.circuit_breaker.failure_threshold,
+        cooldown_seconds=rules.circuit_breaker.cooldown_seconds,
+    )
+    for _ in range(rules.circuit_breaker.failure_threshold):
+        breaker.record_failure()
     assert breaker.is_open()
 
     # Backdate opened_at so cooldown has elapsed
-    breaker._opened_at = time.monotonic() - 61  # 61s ago
+    breaker._opened_at = time.monotonic() - (rules.circuit_breaker.cooldown_seconds + 1)
 
-    # is_open() will now transition to HALF_OPEN internally
+    # is_open() will now see elapsed > cooldown and transition to HALF_OPEN
     assert not breaker.is_open(), "Breaker should be half-open (allows one trial)"
     assert breaker.state == BreakerState.HALF_OPEN
 
@@ -265,7 +282,13 @@ async def test_fb06_half_open_recovery(groq, gemini, openrouter):
             return_value=Response(200, json=_groq_body("Groq recovered"))
         )
 
-        resp, provider = await _run_chain([groq, gemini, openrouter])
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
 
     assert provider == "groq"
     assert resp.text == "Groq recovered"
@@ -274,27 +297,72 @@ async def test_fb06_half_open_recovery(groq, gemini, openrouter):
 
 
 # ---------------------------------------------------------------------------
-# FB-07: Timeout — Groq hangs, fails over to Gemini within bounded time
+# FB-07: Timeout — Groq hangs on all retries, fails over to Gemini
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fb07_timeout_failover(groq, gemini, openrouter):
+async def test_fb07_timeout_failover(rules, clients):
     import httpx
 
     with respx.mock(assert_all_called=False) as mock:
-        # Make Groq raise a TimeoutException
-        mock.post(_GROQ_BASE_URL).mock(side_effect=httpx.TimeoutException("timeout"))
-        gemini_url = _GEMINI_BASE_URL.replace("{model}", "gemini-2.0-flash")
-        gemini_route = mock.post(gemini_url).mock(
+        groq_route = mock.post(_GROQ_BASE_URL).mock(
+            side_effect=httpx.TimeoutException("timeout")
+        )
+        gemini_route = mock.post(_GEMINI_FLASH_URL).mock(
             return_value=Response(200, json=_gemini_body("Gemini after timeout"))
         )
 
         start = time.monotonic()
-        resp, provider = await _run_chain([groq, gemini, openrouter])
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
         elapsed = time.monotonic() - start
 
     assert provider == "gemini"
     assert resp.text == "Gemini after timeout"
-    # Should complete well within 9.5s (mocked timeout is instant)
-    assert elapsed < 9.5, f"Took too long: {elapsed:.2f}s"
+    # Groq is retried MAX_RETRIES+1 times before giving up (mocked so instant)
+    assert groq_route.call_count == MAX_RETRIES + 1
     assert gemini_route.called
+    # All mocked — should complete well within 1s regardless of retry count
+    assert elapsed < 9.5, f"Took too long: {elapsed:.2f}s"
+
+
+# ---------------------------------------------------------------------------
+# FB-08: Retry succeeds on second attempt — no fallback needed
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fb08_retry_succeeds_no_fallback(rules, clients):
+    """If the first attempt fails but the retry succeeds, no fallback occurs."""
+    call_count = 0
+
+    async def flaky_complete(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise ProviderError("groq", "transient error")
+        return ProviderResponse(text="Groq on retry", input_tokens=5, output_tokens=3, raw={})
+
+    clients["groq"].complete = flaky_complete
+
+    with respx.mock(assert_all_called=False) as mock:
+        gemini_route = mock.post(_GEMINI_FLASH_URL).mock(
+            return_value=Response(200, json=_gemini_body())
+        )
+
+        resp, provider, model = await route_request(
+            messages=MESSAGES,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            rules=rules,
+            provider_clients=clients,
+        )
+
+    assert provider == "groq"
+    assert resp.text == "Groq on retry"
+    assert call_count == 2  # failed once, succeeded on retry
+    assert not gemini_route.called  # no fallback needed
